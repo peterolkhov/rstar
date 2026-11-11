@@ -1,0 +1,164 @@
+name: Geo31 rstar unchanged-source BEFORE diagnosis
+
+on:
+  push:
+    branches: [codex/diagnose-integer-line]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  before:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact upstream source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: georust/rstar
+          ref: 0bb77a71b81dd0f97f674a77f526ba7dea0ba4eb
+          path: source
+          persist-credentials: false
+      - name: Record pin and installed stable Rust
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 0bb77a71b81dd0f97f674a77f526ba7dea0ba4eb
+          git status --short
+          git diff --exit-code
+          git diff --cached --exit-code
+          rustc --version --verbose
+          cargo --version
+          python3 - <<'PY_VERSION'
+          import re, subprocess
+          version = subprocess.check_output(["rustc", "--version"], text=True)
+          match = re.match(r"rustc (\d+)\.(\d+)\.(\d+)", version)
+          assert match, version
+          assert tuple(map(int, match.groups())) >= (1, 90, 0), version
+          PY_VERSION
+      - name: Add only the public API regression probe
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p rstar/tests
+          test ! -e rstar/tests/geo31_integer_line.rs
+          cat > rstar/tests/geo31_integer_line.rs <<'RUST_PROBE'
+          // Integration regression probe for pinned upstream rstar. Production code is unchanged.
+          use rstar::{primitives::Line, PointDistance, RTree};
+          
+          #[test]
+          fn integer_segment_interior_is_contained() {
+              let line = Line::new([0_i32, 0], [6, 0]);
+              let query = [3, 0];
+              println!("integer point={:?} distance_2={} contains={}", line.nearest_point(&query), line.distance_2(&query), line.contains_point(&query));
+              assert_eq!(line.nearest_point(&query), query);
+              assert_eq!(line.distance_2(&query), 0);
+              assert!(line.contains_point(&query));
+          }
+          
+          #[test]
+          fn integer_segment_interior_survives_tree_queries() {
+              let line = Line::new([0_i32, 0], [6, 0]);
+              let tree = RTree::bulk_load(vec![line]);
+              println!("integer locate={:?} radius_zero_count={}", tree.locate_at_point([3, 0]), tree.locate_within_distance([3, 0], 0).count());
+              assert_eq!(tree.locate_at_point([3, 0]), Some(&line));
+              assert_eq!(tree.locate_within_distance([3, 0], 0).count(), 1);
+          }
+          
+          #[test]
+          fn integer_segment_nearest_neighbor_is_geometrically_nearest() {
+              let covering = Line::new([0_i32, 0], [6, 0]);
+              let farther = Line::new([3_i32, 1], [3, 2]);
+              let tree = RTree::bulk_load(vec![covering, farther]);
+              println!("integer nearest={:?}", tree.nearest_neighbor_with_distance_2([3, 0]));
+              assert_eq!(tree.nearest_neighbor([3, 0]), Some(&covering));
+          }
+          
+          #[test]
+          fn float_control_segment_queries_agree_with_geometry() {
+              let covering = Line::new([0_f64, 0.], [6., 0.]);
+              let farther = Line::new([3_f64, 1.], [3., 2.]);
+              let query = [3., 0.];
+              assert_eq!(covering.nearest_point(&query), query);
+              assert_eq!(covering.distance_2(&query), 0.);
+              assert!(covering.contains_point(&query));
+              let tree = RTree::bulk_load(vec![covering, farther]);
+              assert_eq!(tree.locate_at_point(query), Some(&covering));
+              assert_eq!(tree.locate_within_distance(query, 0.).count(), 1);
+              assert_eq!(tree.nearest_neighbor(query), Some(&covering));
+          }
+          
+          #[test]
+          fn representable_integer_midpoints_are_fixed_points() {
+              let cases = [
+                  ([0_i32, 0], [6, 0], [3, 0]),
+                  ([6, 0], [0, 0], [3, 0]),
+                  ([-2, -6], [-2, 0], [-2, -3]),
+                  ([0, 0], [6, 6], [3, 3]),
+                  ([-6, -6], [0, 0], [-3, -3]),
+              ];
+              for (from, to, midpoint) in cases {
+                  let line = Line::new(from, to);
+                  // The arithmetic midpoint is exactly integral and lies on the segment.
+                  assert_eq!(line.nearest_point(&midpoint), midpoint, "{line:?}");
+                  assert_eq!(line.distance_2(&midpoint), 0, "{line:?}");
+              }
+          }
+          RUST_PROBE
+          git diff --exit-code
+          git diff --cached --exit-code
+          python3 - <<'PY_STATUS'
+          import subprocess
+          status = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=all"], text=True)
+          assert status.splitlines() == ["?? rstar/tests/geo31_integer_line.rs"], status
+          print("Production source is unchanged; only the untracked integration probe was added.")
+          PY_STATUS
+      - name: Prove the four integer failures and passing float control
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          cargo test -p rstar --test geo31_integer_line -- --nocapture --test-threads=1 > "$RUNNER_TEMP/geo31-before.log" 2>&1
+          test_status=$?
+          set -e
+          cat "$RUNNER_TEMP/geo31-before.log"
+          python3 - "$test_status" "$RUNNER_TEMP/geo31-before.log" <<'PY_RESULTS'
+          import pathlib, re, sys
+          status = int(sys.argv[1])
+          log = pathlib.Path(sys.argv[2]).read_text()
+          assert status == 101, f"Expected Rust assertion-failure exit 101, got {status}"
+          assert "could not compile" not in log, "Compile failures do not reproduce the defect"
+          failed = [
+              "integer_segment_interior_is_contained",
+              "integer_segment_interior_survives_tree_queries",
+              "integer_segment_nearest_neighbor_is_geometrically_nearest",
+              "representable_integer_midpoints_are_fixed_points",
+          ]
+          for name in failed:
+              assert re.search(r"^test " + name + r" \.\.\.", log, re.M), name
+              assert re.search(r"thread '" + name + r"'.*panicked at", log), name
+              assert re.search(r"^    " + name + r"$", log, re.M), name
+          assert re.search(r"^test float_control_segment_queries_agree_with_geometry \.\.\..*ok$", log, re.M)
+          assert "1 passed; 4 failed; 0 ignored" in log, "Unexpected test counts"
+          assert "integer point=[0, 0] distance_2=9 contains=false" in log
+          assert "integer locate=None radius_zero_count=0" in log
+          assert "Line { from: [3, 1], to: [3, 2] }, 1" in log
+          print("DIAGNOSTIC BEFORE CONFIRMED: four integer assertions failed and float control passed.")
+          print("This successful diagnostic job does not mean the product regression tests passed.")
+          PY_RESULTS
+      - name: Run unchanged existing default library tests
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p rstar --lib
+          git diff --exit-code
+          git diff --cached --exit-code
+          test "$(git rev-parse HEAD)" = 0bb77a71b81dd0f97f674a77f526ba7dea0ba4eb
